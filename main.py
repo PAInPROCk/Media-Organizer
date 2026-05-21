@@ -8,6 +8,10 @@ import queue
 import time
 import math
 import logging
+import json
+import random
+import cv2
+from PIL import Image, ImageTk
 from telethon import TelegramClient, types, functions, utils, helpers
 from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
 from dotenv import load_dotenv
@@ -21,117 +25,110 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
-# Silence internal Telethon noise to focus on speed
 logging.getLogger('telethon').setLevel(logging.WARNING)
-logger = logging.getLogger("MediaOrganizer")
+logger = logging.getLogger("MediaSuggester")
 
-# --- Telegram Configuration ---
-# Credentials are now loaded from a .env file (not committed to GitHub)
+# --- Constants & Config ---
+CONFIG_FILE = "config.json"
+MEDIA_EXTENSIONS = {
+    # Videos
+    '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm',
+    # Pictures
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'
+}
+
+# Telegram Credentials from .env
 API_ID = os.getenv('TG_API_ID', '')
 API_HASH = os.getenv('TG_API_HASH', '')
 
+# --- Configuration Manager ---
+class ConfigManager:
+    @staticmethod
+    def load():
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        return {"directories": []}
+
+    @staticmethod
+    def save(config):
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+
+# --- Telegram Manager (Existing Logic) ---
 class TelegramManager:
-    """Handles Telegram operations in a separate thread to keep the UI responsive."""
     def __init__(self, api_id, api_hash):
         self.api_id = api_id
         self.api_hash = api_hash
         self.client = None
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_event_loop, daemon=True)
-        logger.info("Initializing Telegram Manager thread...")
         self.thread.start()
 
     def _run_event_loop(self):
         asyncio.set_event_loop(self.loop)
-        logger.info("Event loop started.")
         self.loop.run_forever()
 
     async def _init_client(self, phone_cb, code_cb, pass_cb):
         if not self.client:
-            logger.info("Creating new TelegramClient (TcpAbridged)...")
             self.client = TelegramClient(
                 'media_organizer_session', 
                 self.api_id, 
                 self.api_hash,
                 connection=ConnectionTcpAbridged
             )
-            await self.client.start(
-                phone=phone_cb,
-                code_callback=code_cb,
-                password=pass_cb
-            )
-            logger.info(f"Connected to DC: {self.client.session.dc_id}")
+            await self.client.start(phone=phone_cb, code_callback=code_cb, password=pass_cb)
 
     async def _fast_upload(self, file_path, progress_cb, filename):
-        """Stable high-speed upload using a focused Worker Pool."""
         file_size = os.path.getsize(file_path)
-        
-        # Optimal part size (512KB for files > 10MB)
-        if file_size <= 10 * 1024 * 1024:
-            part_size = 128 * 1024
-        else:
-            part_size = 512 * 1024
+        if file_size <= 1024 * 1024: part_size = 32 * 1024
+        elif file_size <= 10 * 1024 * 1024: part_size = 64 * 1024
+        elif file_size <= 375 * 1024 * 1024: part_size = 128 * 1024
+        elif file_size <= 750 * 1024 * 1024: part_size = 256 * 1024
+        else: part_size = 512 * 1024
             
         parts_count = math.ceil(file_size / part_size)
         file_id = helpers.generate_random_long()
         is_big = file_size > 10 * 1024 * 1024
         
-        logger.info(f"Starting Upload: {filename} ({file_size / (1024*1024):.2f} MB)")
-
         start_time = time.time()
         sent_bytes = 0
         lock = asyncio.Lock()
-        
-        part_queue = asyncio.Queue()
-        for i in range(parts_count):
-            await part_queue.put(i)
-
-        # Worker count (4 is more stable for high latency / DC5 connections)
         worker_count = 4
-        
+        part_queue = asyncio.Queue()
+        for i in range(parts_count): await part_queue.put(i)
+
         async def upload_worker(worker_id):
             nonlocal sent_bytes
             sender = None
             try:
-                # Slot 0 uses main client, others borrow
-                if worker_id == 0:
-                    sender = self.client._sender
+                if worker_id == 0: sender = self.client._sender
                 else:
-                    try:
-                        sender = await self.client._borrow_exported_sender(self.client.session.dc_id)
-                    except:
-                        sender = self.client._sender
+                    try: sender = await self.client._borrow_exported_sender(self.client.session.dc_id)
+                    except: sender = self.client._sender
 
                 while True:
-                    try:
-                        part_index = part_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+                    try: part_index = part_queue.get_nowait()
+                    except asyncio.QueueEmpty: break
                     
                     with open(file_path, 'rb') as f:
                         f.seek(part_index * part_size)
                         data = f.read(part_size)
                     
                     try:
-                        if is_big:
-                            req = functions.upload.SaveBigFilePartRequest(file_id, part_index, parts_count, data)
-                        else:
-                            req = functions.upload.SaveFilePartRequest(file_id, part_index, data)
-                        
-                        if sender == self.client._sender:
-                            await self.client(req)
-                        else:
-                            await sender.send(req)
-                        
+                        req = functions.upload.SaveBigFilePartRequest(file_id, part_index, parts_count, data) if is_big else functions.upload.SaveFilePartRequest(file_id, part_index, data)
+                        await (self.client(req) if sender == self.client._sender else sender.send(req))
                         async with lock:
                             sent_bytes += len(data)
                             elapsed = time.time() - start_time
                             speed = sent_bytes / elapsed if elapsed > 0 else 0
                             progress_cb(sent_bytes, file_size, speed, filename)
-                    except Exception as e:
-                        # logger.warning(f"Part {part_index} retry due to: {e}")
+                    except:
                         await part_queue.put(part_index)
-                        await asyncio.sleep(1) # Backoff
+                        await asyncio.sleep(1)
                     finally:
                         part_queue.task_done()
             finally:
@@ -139,15 +136,10 @@ class TelegramManager:
                     try: await self.client._return_exported_sender(sender)
                     except: pass
 
-        # Start workers
         workers = [asyncio.create_task(upload_worker(i)) for i in range(worker_count)]
         await part_queue.join()
         for w in workers: w.cancel()
         
-        total_time = time.time() - start_time
-        avg_speed = (file_size / total_time) / (1024*1024) if total_time > 0 else 0
-        logger.info(f"Upload Complete! Avg Speed: {avg_speed:.2f} MB/s")
-
         if is_big: return types.InputFileBig(file_id, parts_count, filename)
         else: return types.InputFile(file_id, parts_count, filename, "")
 
@@ -155,112 +147,212 @@ class TelegramManager:
         async def _upload():
             try:
                 await self._init_client(phone_cb, code_cb, pass_cb)
-                total_files = len(file_paths)
                 for i, path in enumerate(file_paths):
                     file_name = os.path.basename(path)
-                    logger.info(f"Processing file {i+1}/{total_files}: {file_name}")
-                    
                     input_file = await self._fast_upload(path, file_progress_cb, file_name)
-                    
-                    logger.info("Registering file with Telegram...")
                     await self.client.send_file('me', input_file)
-                    
-                    overall_progress_cb(i + 1, total_files)
-                
-                logger.info("All files uploaded successfully.")
-                done_cb(total_files)
+                    overall_progress_cb(i + 1, len(file_paths))
+                done_cb(len(file_paths))
             except Exception as e:
-                logger.error(f"Upload session failed: {e}")
                 error_cb(str(e))
-
         asyncio.run_coroutine_threadsafe(_upload(), self.loop)
 
-class MediaOrganizerApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Media Organizer + Cloud")
-        self.root.geometry("800x800")
-        self.root.minsize(600, 650)
+# --- UI Utilities ---
+def bind_mouse_wheel(canvas):
+    def on_mouse_wheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    canvas.bind_all("<MouseWheel>", on_mouse_wheel)
 
-        # Configuration
-        self.media_extensions = {
-            # Videos
-            '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm',
-            # Pictures
-            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'
-        }
+# --- Thumbnail Generator ---
+class ThumbnailGenerator:
+    def __init__(self):
+        self.cache = {}
 
-        # State
-        self.source_dir = ""
-        self.all_files = [] 
-        self.filtered_files = [] 
-        self.check_vars = {} 
-        self.tg_manager = None
+    def get_thumbnail(self, file_path, size=(200, 112)):
+        if file_path in self.cache:
+            return self.cache[file_path]
+        
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}:
+                img = Image.open(file_path)
+                img.thumbnail(size)
+                photo = ImageTk.PhotoImage(img)
+                self.cache[file_path] = photo
+                return photo
+            else:
+                cap = cv2.VideoCapture(file_path)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames // 10)
+                ret, frame = cap.read()
+                if ret:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(frame)
+                    img.thumbnail(size)
+                    photo = ImageTk.PhotoImage(img)
+                    self.cache[file_path] = photo
+                    cap.release()
+                    return photo
+                cap.release()
+        except Exception as e:
+            logger.error(f"Thumbnail error for {file_path}: {e}")
+        return None
 
+# --- Main Application Frame Classes ---
+
+class HomeFrame(ttk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+        self.thumb_gen = ThumbnailGenerator()
         self.setup_ui()
 
     def setup_ui(self):
-        # --- Top Section ---
-        top_frame = ttk.Frame(self.root, padding="10")
-        top_frame.pack(fill=tk.X)
-        ttk.Button(top_frame, text="Browse Folder", command=self.browse_folder).pack(side=tk.LEFT, padx=5)
-        self.lbl_path = ttk.Label(top_frame, text="No folder selected", foreground="gray")
+        header = ttk.Frame(self, padding=10)
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="Recommended for You", font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
+        ttk.Button(header, text="Refresh", command=self.refresh_suggestions).pack(side=tk.RIGHT)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, bg="#f0f0f0")
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas, style="Card.TFrame")
+        
+        self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        
+        # Enable smooth scrolling
+        self.canvas.bind("<Enter>", lambda e: bind_mouse_wheel(self.canvas))
+
+    def refresh_suggestions(self):
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+
+        config = ConfigManager.load()
+        all_media = []
+        for d in config["directories"]:
+            if os.path.exists(d):
+                for root, _, files in os.walk(d):
+                    for f in files:
+                        if os.path.splitext(f)[1].lower() in MEDIA_EXTENSIONS:
+                            all_media.append(os.path.join(root, f))
+        
+        if not all_media:
+            ttk.Label(self.scrollable_frame, text="No media found. Add directories in Settings.", padding=20).pack()
+            return
+
+        suggestions = random.sample(all_media, min(len(all_media), 20))
+        
+        # Grid settings
+        cols = 4
+        for i, path in enumerate(suggestions):
+            frame = ttk.Frame(self.scrollable_frame, padding=5, cursor="hand2")
+            frame.grid(row=i//cols, column=i%cols, padx=10, pady=10, sticky="n")
+            
+            # Thumbnail Placeholder
+            lbl_thumb = ttk.Label(frame, text="Loading...", cursor="hand2")
+            lbl_thumb.pack()
+            
+            name = os.path.basename(path)
+            if len(name) > 25: name = name[:22] + "..."
+            
+            lbl_name = ttk.Label(frame, text=name, font=("Segoe UI", 9, "bold"), wraplength=180, cursor="hand2")
+            lbl_name.pack(pady=(5,0))
+            
+            lbl_path = ttk.Label(frame, text=os.path.dirname(path), font=("Segoe UI", 7), foreground="gray", wraplength=180, cursor="hand2")
+            lbl_path.pack()
+
+            # Bind click event to EVERYTHING inside the card
+            def open_file(e, p=path):
+                try:
+                    os.startfile(p)
+                except Exception as ex:
+                    messagebox.showerror("Error", f"Could not open file: {ex}")
+
+            frame.bind("<Button-1>", open_file)
+            lbl_thumb.bind("<Button-1>", open_file)
+            lbl_name.bind("<Button-1>", open_file)
+            lbl_path.bind("<Button-1>", open_file)
+            
+            # Generate thumbnail in background thread
+            threading.Thread(target=self.load_thumb, args=(path, lbl_thumb), daemon=True).start()
+
+    def load_thumb(self, path, label):
+        photo = self.thumb_gen.get_thumbnail(path)
+        if photo:
+            self.controller.after(0, lambda: label.configure(image=photo, text=""))
+            # Keep reference to avoid GC
+            label.image = photo
+
+class OrganizerFrame(ttk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+        self.source_dir = ""
+        self.all_files = []
+        self.filtered_files = []
+        self.check_vars = {}
+        self.tg_manager = None
+        self.setup_ui()
+
+    def setup_ui(self):
+        # Top Browse
+        top = ttk.Frame(self, padding=10)
+        top.pack(fill=tk.X)
+        ttk.Button(top, text="Browse Folder", command=self.browse_folder).pack(side=tk.LEFT, padx=5)
+        self.lbl_path = ttk.Label(top, text="No folder selected", foreground="gray")
         self.lbl_path.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
-        # --- Search ---
-        search_frame = ttk.Frame(self.root, padding="10")
-        search_frame.pack(fill=tk.X)
-        ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=5)
-        self.entry_search = ttk.Entry(search_frame)
+        # Search
+        search_f = ttk.Frame(self, padding=10)
+        search_f.pack(fill=tk.X)
+        ttk.Label(search_f, text="Search:").pack(side=tk.LEFT, padx=5)
+        self.entry_search = ttk.Entry(search_f)
         self.entry_search.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         self.entry_search.bind("<KeyRelease>", lambda e: self.filter_files())
-        ttk.Button(search_frame, text="Clear", command=self.clear_search).pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_f, text="Clear", command=self.clear_search).pack(side=tk.LEFT, padx=5)
 
-        # --- Selection ---
-        ctrl_frame = ttk.Frame(self.root, padding="5 10")
-        ctrl_frame.pack(fill=tk.X)
-        ttk.Button(ctrl_frame, text="Select All Visible", command=self.select_all).pack(side=tk.LEFT, padx=5)
-        ttk.Button(ctrl_frame, text="Deselect All Visible", command=self.deselect_all).pack(side=tk.LEFT, padx=5)
+        # Controls
+        ctrl = ttk.Frame(self, padding=5)
+        ctrl.pack(fill=tk.X)
+        ttk.Button(ctrl, text="Select All Visible", command=self.select_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(ctrl, text="Deselect All Visible", command=self.deselect_all).pack(side=tk.LEFT, padx=5)
 
-        # --- List ---
-        list_container = ttk.Frame(self.root, padding="10")
-        list_container.pack(fill=tk.BOTH, expand=True)
-        self.canvas = tk.Canvas(list_container, highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=self.canvas.yview)
+        # List
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.scrollable_frame = ttk.Frame(self.canvas)
         self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
+        self.canvas.bind("<Enter>", lambda e: bind_mouse_wheel(self.canvas))
 
-        # --- Progress Section (Always present but updated dynamically) ---
-        self.progress_frame = ttk.Frame(self.root, padding="10")
+        # Progress
+        self.progress_frame = ttk.Frame(self, padding=10)
         self.progress_frame.pack(fill=tk.X)
-        
-        # Overall Progress
-        self.lbl_overall = ttk.Label(self.progress_frame, text="Overall Progress: 0/0", font=('Segoe UI', 9, 'bold'))
+        self.lbl_overall = ttk.Label(self.progress_frame, text="Overall Progress: 0/0")
         self.lbl_overall.pack(fill=tk.X)
         self.overall_bar = ttk.Progressbar(self.progress_frame, mode='determinate')
-        self.overall_bar.pack(fill=tk.X, pady=(2, 10))
-
-        # Current File Progress
+        self.overall_bar.pack(fill=tk.X, pady=2)
         self.lbl_file = ttk.Label(self.progress_frame, text="Current File: Ready")
         self.lbl_file.pack(fill=tk.X)
         self.file_bar = ttk.Progressbar(self.progress_frame, mode='determinate')
-        self.file_bar.pack(fill=tk.X, pady=(2, 5))
-        
-        # Speed and Stats
-        self.lbl_stats = ttk.Label(self.progress_frame, text="Speed: 0 KB/s | 0% completed", font=('Segoe UI', 9, 'italic'))
+        self.file_bar.pack(fill=tk.X, pady=2)
+        self.lbl_stats = ttk.Label(self.progress_frame, text="Speed: 0 KB/s", font=('Segoe UI', 8, 'italic'))
         self.lbl_stats.pack(fill=tk.X)
 
-        # --- Actions ---
-        bottom_frame = ttk.Frame(self.root, padding="10")
-        bottom_frame.pack(fill=tk.X)
-        self.btn_cloud = ttk.Button(bottom_frame, text="Upload to Telegram Cloud", command=self.upload_to_cloud)
+        # Actions
+        bot = ttk.Frame(self, padding=10)
+        bot.pack(fill=tk.X)
+        self.btn_cloud = ttk.Button(bot, text="Upload to Telegram", command=self.upload_to_cloud)
         self.btn_cloud.pack(side=tk.LEFT, padx=5)
-        ttk.Button(bottom_frame, text="Move to New Folder", command=self.move_to_new).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(bottom_frame, text="Move to Existing Folder", command=self.move_to_existing).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bot, text="Move to New Folder", command=self.move_to_new).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bot, text="Move to Existing Folder", command=self.move_to_existing).pack(side=tk.RIGHT, padx=5)
 
     def browse_folder(self):
         d = filedialog.askdirectory()
@@ -273,34 +365,27 @@ class MediaOrganizerApp:
         if not self.source_dir: return
         self.all_files = []
         try:
-            for root, dirs, files in os.walk(self.source_dir):
-                for item in files:
-                    full_path = os.path.join(root, item)
-                    rel_path = os.path.relpath(full_path, self.source_dir)
-                    _, ext = os.path.splitext(item.lower())
-                    if ext in self.media_extensions:
-                        self.all_files.append(rel_path)
+            for root, _, files in os.walk(self.source_dir):
+                for f in files:
+                    if os.path.splitext(f)[1].lower() in MEDIA_EXTENSIONS:
+                        self.all_files.append(os.path.relpath(os.path.join(root, f), self.source_dir))
             self.all_files.sort()
             self.filter_files()
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        except Exception as e: messagebox.showerror("Error", str(e))
 
     def filter_files(self):
         term = self.entry_search.get().lower()
         self.filtered_files = [f for f in self.all_files if term in f.lower()]
-        self.update_list_ui()
+        for w in self.scrollable_frame.winfo_children(): w.destroy()
+        self.check_vars = {}
+        for rel in self.filtered_files:
+            var = tk.BooleanVar()
+            self.check_vars[rel] = var
+            ttk.Checkbutton(self.scrollable_frame, text=rel, variable=var).pack(anchor="w", padx=5, pady=2)
 
     def clear_search(self):
         self.entry_search.delete(0, tk.END)
         self.filter_files()
-
-    def update_list_ui(self):
-        for w in self.scrollable_frame.winfo_children(): w.destroy()
-        self.check_vars = {}
-        for rel_path in self.filtered_files:
-            var = tk.BooleanVar()
-            self.check_vars[rel_path] = var
-            ttk.Checkbutton(self.scrollable_frame, text=rel_path, variable=var).pack(anchor="w", padx=5, pady=2)
 
     def select_all(self):
         for v in self.check_vars.values(): v.set(True)
@@ -308,116 +393,167 @@ class MediaOrganizerApp:
     def deselect_all(self):
         for v in self.check_vars.values(): v.set(False)
 
-    # --- Thread-Safe Input ---
-    def ask_string_threadsafe(self, title, prompt):
-        res_queue = queue.Queue()
-        self.root.after(0, lambda: res_queue.put(simpledialog.askstring(title, prompt)))
-        return res_queue.get()
-
-    def get_telegram_phone(self):
-        return self.ask_string_threadsafe("Telegram Login", "Enter phone number (e.g. +91...):")
-
-    def get_telegram_code(self):
-        return self.ask_string_threadsafe("Telegram Login", "Enter the code from Telegram:")
-
-    def get_telegram_password(self):
-        return self.ask_string_threadsafe("Telegram Login", "Enter your 2FA Password (if any):")
-
     def upload_to_cloud(self):
-        if API_ID == 'YOUR_API_ID':
-            messagebox.showerror("Config Error", "Please set API_ID and API_HASH.")
-            return
-
-        selected = [p for p, v in self.check_vars.items() if v.get()]
-        if not selected:
-            messagebox.showwarning("No selection", "Please select files.")
-            return
-
-        if not self.tg_manager:
-            self.tg_manager = TelegramManager(API_ID, API_HASH)
-
-        full_paths = [os.path.join(self.source_dir, p) for p in selected]
+        if not API_ID: return messagebox.showerror("Error", "Check .env for TG_API_ID")
+        sel = [p for p, v in self.check_vars.items() if v.get()]
+        if not sel: return messagebox.showwarning("Warning", "Select files first")
+        if not self.tg_manager: self.tg_manager = TelegramManager(API_ID, API_HASH)
+        
+        full_paths = [os.path.join(self.source_dir, p) for p in sel]
         self.btn_cloud.config(state=tk.DISABLED)
-
-        # Reset UI
-        self.overall_bar['value'] = 0
-        self.file_bar['value'] = 0
-        self.lbl_overall.config(text=f"Overall Progress: 0/{len(selected)}")
-        self.lbl_file.config(text="Starting upload...")
-        self.lbl_stats.config(text="Speed: 0 KB/s | 0% completed")
-
+        
         self.tg_manager.upload_files(
             full_paths,
-            self.get_telegram_phone,
-            self.get_telegram_code,
-            self.get_telegram_password,
-            lambda s, t, sp, fn: self.root.after(0, lambda: self._update_file_progress(s, t, sp, fn)),
-            lambda current, total: self.root.after(0, lambda: self._update_overall_progress(current, total)),
-            lambda count: self.root.after(0, lambda: self._upload_complete(count)),
-            lambda err: self.root.after(0, lambda: self._upload_error(err))
+            lambda: self.controller.ask_string_threadsafe("Login", "Phone:"),
+            lambda: self.controller.ask_string_threadsafe("Login", "Code:"),
+            lambda: self.controller.ask_string_threadsafe("Login", "2FA:"),
+            lambda s, t, sp, fn: self.after(0, lambda: self._up_f(s, t, sp, fn)),
+            lambda c, t: self.after(0, lambda: self._up_o(c, t)),
+            lambda count: self.after(0, lambda: self._up_done(count)),
+            lambda err: self.after(0, lambda: self._up_err(err))
         )
 
-    def _update_file_progress(self, sent, total, speed, filename):
-        percent = (sent / total) * 100 if total > 0 else 0
-        self.file_bar['value'] = percent
-        self.lbl_file.config(text=f"Current File: {filename}")
-        
-        # Format speed
-        if speed > 1024 * 1024:
-            speed_str = f"{speed / (1024 * 1024):.2f} MB/s"
-        elif speed > 1024:
-            speed_str = f"{speed / 1024:.2f} KB/s"
-        else:
-            speed_str = f"{speed:.2f} B/s"
-            
-        self.lbl_stats.config(text=f"Speed: {speed_str} | {percent:.1f}% of this file completed")
+    def _up_f(self, s, t, sp, fn):
+        p = (s/t)*100 if t>0 else 0
+        self.file_bar['value'] = p
+        self.lbl_file.config(text=f"File: {fn}")
+        speed = f"{sp/(1024*1024):.2f} MB/s" if sp > 1024*1024 else f"{sp/1024:.2f} KB/s"
+        self.lbl_stats.config(text=f"Speed: {speed} | {p:.1f}%")
 
-    def _update_overall_progress(self, current, total):
-        self.overall_bar['value'] = (current / total) * 100
-        self.lbl_overall.config(text=f"Overall Progress: {current}/{total}")
+    def _up_o(self, c, t):
+        self.overall_bar['value'] = (c/t)*100
+        self.lbl_overall.config(text=f"Overall: {c}/{t}")
 
-    def _upload_complete(self, count):
+    def _up_done(self, count):
         self.btn_cloud.config(state=tk.NORMAL)
-        self.lbl_file.config(text="All uploads complete!")
-        self.lbl_stats.config(text="Finished.")
-        messagebox.showinfo("Success", f"Uploaded {count} files to Telegram!")
+        messagebox.showinfo("Success", f"Uploaded {count} files")
 
-    def _upload_error(self, err):
+    def _up_err(self, err):
         self.btn_cloud.config(state=tk.NORMAL)
-        self.lbl_file.config(text="Upload failed.")
-        messagebox.showerror("Telegram Error", f"An error occurred: {err}")
+        messagebox.showerror("Error", err)
 
-    # --- Move Logic ---
     def move_to_new(self):
         sel = [p for p, v in self.check_vars.items() if v.get()]
         if not sel: return
-        name = simpledialog.askstring("New Folder", "Folder Name:")
-        if not name: return
-        target = os.path.join(self.source_dir, name)
-        if not os.path.exists(target): os.makedirs(target)
-        self.perform_move(sel, target)
+        n = simpledialog.askstring("New", "Folder Name:")
+        if not n: return
+        t = os.path.join(self.source_dir, n)
+        if not os.path.exists(t): os.makedirs(t)
+        self.perf_move(sel, t)
 
     def move_to_existing(self):
         sel = [p for p, v in self.check_vars.items() if v.get()]
         if not sel: return
-        target = filedialog.askdirectory(initialdir=self.source_dir)
-        if target: self.perform_move(sel, target)
+        t = filedialog.askdirectory(initialdir=self.source_dir)
+        if t: self.perf_move(sel, t)
 
-    def perform_move(self, sel, target):
-        try:
-            count = 0
-            for p in sel:
-                src = os.path.join(self.source_dir, p)
-                dst = os.path.join(target, os.path.basename(p))
-                if os.path.exists(dst):
-                    if not messagebox.askyesno("Exists", f"Overwrite {os.path.basename(p)}?"): continue
-                shutil.move(src, dst)
-                count += 1
-            messagebox.showinfo("Done", f"Moved {count} files.")
-            self.scan_files()
-        except Exception as e: messagebox.showerror("Error", str(e))
+    def perf_move(self, sel, target):
+        c = 0
+        for p in sel:
+            src, dst = os.path.join(self.source_dir, p), os.path.join(target, os.path.basename(p))
+            if os.path.exists(dst) and not messagebox.askyesno("Overwrite", f"Overwrite {os.path.basename(p)}?"): continue
+            shutil.move(src, dst); c += 1
+        messagebox.showinfo("Done", f"Moved {c} files"); self.scan_files()
+
+class SettingsFrame(ttk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+        self.setup_ui()
+
+    def setup_ui(self):
+        ttk.Label(self, text="Watched Directories", font=("Segoe UI", 12, "bold")).pack(pady=10)
+        
+        list_frame = ttk.Frame(self)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=20)
+        
+        self.dir_listbox = tk.Listbox(list_frame, font=("Segoe UI", 10))
+        self.dir_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        sb = ttk.Scrollbar(list_frame, command=self.dir_listbox.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.dir_listbox.config(yscrollcommand=sb.set)
+        
+        btn_frame = ttk.Frame(self, padding=10)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="Add Directory", command=self.add_dir).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Remove Selected", command=self.remove_dir).pack(side=tk.LEFT, padx=5)
+        
+        self.load_list()
+
+    def load_list(self):
+        self.dir_listbox.delete(0, tk.END)
+        config = ConfigManager.load()
+        for d in config["directories"]:
+            self.dir_listbox.insert(tk.END, d)
+
+    def add_dir(self):
+        d = filedialog.askdirectory()
+        if d:
+            config = ConfigManager.load()
+            if d not in config["directories"]:
+                config["directories"].append(d)
+                ConfigManager.save(config)
+                self.load_list()
+
+    def remove_dir(self):
+        sel = self.dir_listbox.curselection()
+        if sel:
+            d = self.dir_listbox.get(sel)
+            config = ConfigManager.load()
+            config["directories"].remove(d)
+            ConfigManager.save(config)
+            self.load_list()
+
+# --- Main App Shell ---
+
+class MediaSuggesterApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Offline Media Suggester")
+        self.geometry("1100x800")
+        
+        # Styles
+        style = ttk.Style()
+        style.configure("Sidebar.TFrame", background="#2c3e50")
+        style.configure("Sidebar.TButton", padding=10, width=20)
+        
+        # Main Layout
+        self.sidebar = ttk.Frame(self, style="Sidebar.TFrame", width=200)
+        self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        self.sidebar.pack_propagate(False)
+
+        self.main_container = ttk.Frame(self)
+        self.main_container.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        self.frames = {}
+        for F in (HomeFrame, OrganizerFrame, SettingsFrame):
+            frame = F(self.main_container, self)
+            self.frames[F] = frame
+            frame.grid(row=0, column=0, sticky="nsew")
+
+        self.main_container.grid_rowconfigure(0, weight=1)
+        self.main_container.grid_columnconfigure(0, weight=1)
+
+        # Sidebar Buttons
+        ttk.Label(self.sidebar, text="MEDIA APP", foreground="white", font=("Segoe UI", 12, "bold"), padding=20).pack()
+        ttk.Button(self.sidebar, text="🏠 Home", style="Sidebar.TButton", command=lambda: self.show_frame(HomeFrame)).pack(pady=5)
+        ttk.Button(self.sidebar, text="📁 Organizer", style="Sidebar.TButton", command=lambda: self.show_frame(OrganizerFrame)).pack(pady=5)
+        ttk.Button(self.sidebar, text="⚙ Settings", style="Sidebar.TButton", command=lambda: self.show_frame(SettingsFrame)).pack(pady=5)
+
+        self.show_frame(HomeFrame)
+
+    def show_frame(self, context):
+        frame = self.frames[context]
+        frame.tkraise()
+        if context == HomeFrame:
+            frame.refresh_suggestions()
+
+    def ask_string_threadsafe(self, title, prompt):
+        res_queue = queue.Queue()
+        self.after(0, lambda: res_queue.put(simpledialog.askstring(title, prompt)))
+        return res_queue.get()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = MediaOrganizerApp(root)
-    root.mainloop()
+    app = MediaSuggesterApp()
+    app.mainloop()
