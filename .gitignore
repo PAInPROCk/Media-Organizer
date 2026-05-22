@@ -211,6 +211,10 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Media Suggester Config
+config.json
+.env
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
