@@ -1,12 +1,15 @@
 import os
 import sys
-
 # --- Aggressive Library Suppression (Must be set BEFORE imports) ---
 os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["AV_LOG_FORCE_NOCOLOR"] = "1"
 os.environ["AV_LOG_LEVEL"] = "quiet"
 os.environ["FFREPORT"] = "level=0"
+
+# Silence urllib3 SSL warnings for aggressive recovery
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import shutil
 import tkinter as tk
@@ -57,9 +60,23 @@ os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 load_dotenv()
 
 # --- Logging Configuration ---
+class UIHandler(logging.Handler):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+        # Match the terminal format
+        self.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.callback(msg)
+        except:
+            pass
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
 logging.getLogger('telethon').setLevel(logging.WARNING)
@@ -74,10 +91,6 @@ MEDIA_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'
 }
 
-# Telegram Credentials from .env
-API_ID = os.getenv('TG_API_ID', '')
-API_HASH = os.getenv('TG_API_HASH', '')
-
 # --- Configuration Manager ---
 class ConfigManager:
     @staticmethod
@@ -88,6 +101,8 @@ class ConfigManager:
             "favorites": [], 
             "tags": {}, 
             "terabox_cookie": "",
+            "tg_api_id": "",
+            "tg_api_hash": "",
             "proxy_type": "None",
             "proxy_addr": "",
             "proxy_port": "",
@@ -102,6 +117,18 @@ class ConfigManager:
             except:
                 pass
         return defaults
+
+    @staticmethod
+    def get_telegram_creds():
+        """Get creds from .env (dev) or config.json (release/user)."""
+        env_id = os.getenv('TG_API_ID', '')
+        env_hash = os.getenv('TG_API_HASH', '')
+        
+        if env_id and env_hash:
+            return env_id, env_hash
+            
+        config = ConfigManager.load()
+        return config.get("tg_api_id", ""), config.get("tg_api_hash", "")
 
     @staticmethod
     def save(config):
@@ -129,35 +156,41 @@ class ThumbnailGenerator:
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
         self.session = requests.Session()
+        # Modern Edge/Chrome UA for better acceptance
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
         })
 
     def _worker_loop(self):
         while not self.stop_event.is_set():
             try:
                 item = self.request_queue.get(timeout=1)
-                priority, count, path_or_url, label, referer = item
+                priority, count, path_or_url, label, extra_headers = item
                 
                 if path_or_url in self.cache:
                     photo = self.cache[path_or_url]
                 else:
                     if path_or_url.startswith('http'):
-                        photo = self._download_remote_thumbnail(path_or_url, referer)
+                        logger.info(f"Thumb: Downloading remote {path_or_url[:50]}...")
+                        photo = self._download_remote_thumbnail(path_or_url, extra_headers)
                     else:
+                        logger.info(f"Thumb: Extracting local {os.path.basename(path_or_url)}")
                         photo = self._extract_thumbnail(path_or_url)
                     
                     if photo:
                         self.cache[path_or_url] = photo
+                        # logger.info(f"Thumb: Successfully processed.")
                 
                 if photo and label.winfo_exists():
                     self.controller.after(0, lambda p=photo, l=label: self._update_ui(p, l))
                 
                 self.request_queue.task_done()
-                time.sleep(0.1) 
+                time.sleep(0.02) 
             except queue.Empty:
                 continue
-            except:
+            except Exception as e:
+                logger.error(f"Thumb Worker Error: {e}")
                 continue
 
     def _update_ui(self, photo, label):
@@ -167,20 +200,59 @@ class ThumbnailGenerator:
         except:
             pass
 
-    def _download_remote_thumbnail(self, url, referer=None):
-        try:
-            headers = {}
-            if referer:
-                headers["Referer"] = referer
-            resp = self.session.get(url, timeout=10, headers=headers)
-            if resp.status_code == 200:
-                from io import BytesIO
-                img = Image.open(BytesIO(resp.content))
-                img.thumbnail((200, 112))
-                return ImageTk.PhotoImage(img)
-        except:
-            pass
-        return None
+    def _download_remote_thumbnail(self, url, extra_headers=None):
+        # Mirror clusters
+        tb_mirrors = ["dm-data.1024terabox.com", "data.1024terabox.com", "www.terabox.app", "1024tera.com"]
+        bunkr_mirrors = ["static.scdn.st", "media-files.bunkr.si", "i.bunkr.su", "static.bunkr.ru", "cdn.bunkr.black", "bunkr.is", "bunkr.media", "bunkr.ph", "bunkr.ws", "bunkr.site"]
+        
+        def _attempt(target_url, label_str, wait=4, mirror_ref=None):
+            try:
+                headers = self.session.headers.copy()
+                if mirror_ref is not None:
+                    if mirror_ref == "": # Explicitly remove if empty
+                        if "Referer" in headers: del headers["Referer"]
+                    else:
+                        headers["Referer"] = mirror_ref
+                elif extra_headers:
+                    if isinstance(extra_headers, dict): headers.update(extra_headers)
+                    elif isinstance(extra_headers, str): headers["Referer"] = extra_headers
+                
+                resp = self.session.get(target_url, timeout=wait, headers=headers, verify=False)
+                if resp.status_code == 200:
+                    from io import BytesIO
+                    img = Image.open(BytesIO(resp.content))
+                    img.thumbnail((200, 112))
+                    return ImageTk.PhotoImage(img)
+            except: pass
+            return None
+
+        # 1. TeraBox Optimization: Skip blocked primary immediately
+        if "dm-data.terabox.com" in url:
+             parsed = urllib.parse.urlparse(url)
+             for m in tb_mirrors:
+                 res = _attempt(parsed._replace(netloc=m).geturl(), "TB-Mirror", wait=3)
+                 if res: return res
+        
+        # 2. Bunkr Optimization: Aggressive mirror & dynamic referer cycling
+        if "bunkr" in url or "scdn.st" in url:
+            parsed = urllib.parse.urlparse(url)
+            # Try original first
+            res = _attempt(url, "Bunkr-Primary", wait=4)
+            if res: return res
+            
+            # Try swapping across all mirrors with dynamic referers
+            for m in bunkr_mirrors:
+                if m in parsed.netloc: continue
+                m_root = "https://" + ".".join(m.split(".")[-2:]) + "/"
+                # Try with root referer
+                res = _attempt(parsed._replace(netloc=m).geturl(), "Bunkr-Mirror", wait=3, mirror_ref=m_root)
+                if res: return res
+                # Try without referer
+                res = _attempt(parsed._replace(netloc=m).geturl(), "Bunkr-Mirror-NoRef", wait=3, mirror_ref="")
+                if res: return res
+
+        # 3. Standard attempt
+        return _attempt(url, "Standard", wait=5)
 
     def _extract_thumbnail(self, file_path, size=(200, 112)):
         try:
@@ -205,9 +277,9 @@ class ThumbnailGenerator:
             pass
         return None
 
-    def queue_thumbnail(self, path_or_url, label, priority=10, referer=None):
+    def queue_thumbnail(self, path_or_url, label, priority=10, extra_headers=None):
         self.counter += 1
-        self.request_queue.put((priority, self.counter, path_or_url, label, referer))
+        self.request_queue.put((priority, self.counter, path_or_url, label, extra_headers))
 
 # --- Tag Engine ---
 class TagEngine:
@@ -507,6 +579,9 @@ class BunkrManager:
                     thumb = None
                     if thumb_tag:
                         thumb = thumb_tag.get('data-src') or thumb_tag.get('src')
+                        # Skip placeholders
+                        if thumb and ('video.svg' in thumb or 'image.svg' in thumb):
+                            thumb = None
                     
                     if thumb and not thumb.startswith('http'):
                         thumb = urllib.parse.urljoin(album_url, thumb)
@@ -655,7 +730,6 @@ class BunkrFrame(ttk.Frame):
                 files = self.bunkr_manager.list_album_files(url)
                 all_files.extend(files)
             
-            # Update UI on main thread
             self.after(0, lambda: self._display_files(all_files))
 
         threading.Thread(target=_bg_load, daemon=True).start()
@@ -692,7 +766,7 @@ class BunkrFrame(ttk.Frame):
             return
 
         if thumb_url:
-             self.controller.thumb_gen.queue_thumbnail(thumb_url, lbl_thumb, priority=5, referer=referer)
+             self.controller.thumb_gen.queue_thumbnail(thumb_url, lbl_thumb, priority=5, extra_headers={"Referer": referer})
 
         dname = name[:20] + "..." if len(name) > 23 else name
         lbl_name = ttk.Label(card, text=dname, font=("Segoe UI", 9, "bold"), wraplength=180, cursor="hand2")
@@ -708,10 +782,25 @@ class BunkrFrame(ttk.Frame):
         if ext in {'.mp4', '.mkv', '.avi', '.mov', '.webm'}:
             btns = ttk.Frame(card)
             btns.pack(pady=2)
-            # Use Embedded VLC for the actual stream
-            ttk.Button(btns, text="VLC", width=8, command=lambda u=url, n=name: self.play_in_embedded_vlc(u, n)).pack(side=tk.LEFT, padx=2)
-            # Use Browser Player for the Bunkr web page
-            ttk.Button(btns, text="In-App", width=8, command=lambda u=url, n=name: self.controller.play_in_browser(u, n)).pack(side=tk.LEFT, padx=2)
+            ttk.Button(btns, text="VLC", width=6, command=lambda u=url, n=name: self.play_in_embedded_vlc(u, n)).pack(side=tk.LEFT, padx=2)
+            ttk.Button(btns, text="In-App", width=7, command=lambda u=url, n=name: self.controller.play_in_browser(u, n)).pack(side=tk.LEFT, padx=2)
+            ttk.Button(btns, text="📥", width=3, command=lambda u=url, n=name: self.download_bunkr_file(u, n)).pack(side=tk.LEFT, padx=2)
+
+    def download_bunkr_file(self, page_url, name):
+        def _resolve():
+            logger.info(f"Bunkr: Resolving download for {name}...")
+            dlink = self.bunkr_manager.get_direct_link(page_url)
+            if dlink:
+                ref = "/".join(page_url.split("/")[:3]) + "/"
+                headers = {
+                    "Referer": ref,
+                    "User-Agent": self.bunkr_manager.session.headers.get("User-Agent")
+                }
+                self.after(0, lambda: self.controller.start_cloud_download(dlink, name, headers))
+            else:
+                self.after(0, lambda: messagebox.showerror("Error", "Could not resolve Bunkr download link."))
+        
+        threading.Thread(target=_resolve, daemon=True).start()
 
     def play_in_embedded_vlc(self, page_url, title):
         def _resolve():
@@ -720,40 +809,9 @@ class BunkrFrame(ttk.Frame):
                 self.after(0, lambda: messagebox.showerror("Bunkr", "Could not extract direct link for VLC."))
                 return
             
-            # Referer for playback
             ref = "/".join(page_url.split("/")[:3]) + "/"
             options = [f":http-referrer={ref}", f":http-user-agent={self.bunkr_manager.session.headers.get('User-Agent')}"]
-            
             self.after(0, lambda: self.controller.play_in_app(dlink, title, options))
-
-        threading.Thread(target=_resolve, daemon=True).start()
-
-    def play_in_vlc(self, page_url):
-        def _resolve():
-            dlink = self.bunkr_manager.get_direct_link(page_url)
-            if not dlink:
-                self.after(0, lambda: messagebox.showerror("Bunkr", "Could not extract direct link for VLC."))
-                return
-            
-            vlc_paths = [r"C:\Program Files\VideoLAN\VLC\vlc.exe", r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"]
-            vlc_exe = next((p for p in vlc_paths if os.path.exists(p)), "vlc")
-            
-            import subprocess
-            try:
-                ua = self.bunkr_manager.session.headers.get("User-Agent")
-                # Referer for playback should usually be the site root or the specific page
-                ref = "/".join(page_url.split("/")[:3]) + "/"
-                
-                # Use separate list elements for flags and values (safer for Windows parser)
-                cmd = [
-                    vlc_exe,
-                    "--http-user-agent", ua,
-                    "--http-referrer", ref,
-                    dlink
-                ]
-                subprocess.Popen(cmd)
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("VLC Error", f"Could not launch VLC: {e}"))
 
         threading.Thread(target=_resolve, daemon=True).start()
 
@@ -761,113 +819,107 @@ class TeraBoxManager:
     def __init__(self, cookie):
         self.cookie = cookie
         self.session = requests.Session()
-        # Increase pool size and block when full to avoid discarding connections
-        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50, pool_block=True)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=100, pool_block=True)
         self.session.mount("https://", adapter)
         
-        self.thumb_executor = ThreadPoolExecutor(max_workers=8)
-        
-        # Parse cookie string flexibly
         c_str = cookie.strip()
-        if ":" in c_str and "=" not in c_str:
-            # Handle user pasted format: "ndus: val, ndus_fmt: val"
-            parts = [p.strip() for p in c_str.split(",")]
-            c_str = "; ".join([p.replace(": ", "=").replace(":", "=") for p in parts])
-        elif "=" not in c_str and c_str:
-            c_str = f"ndus={cookie}"
+        if c_str and "=" not in c_str:
+            c_str = f"ndus={c_str}"
             
         self.domain = "dm.1024terabox.com"
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
             "Cookie": c_str,
-            "Referer": f"https://{self.domain}/main"
+            "Referer": f"https://{self.domain}/main",
+            "Connection": "keep-alive"
         })
 
-    def list_files(self, directory="/"):
-        url = f"https://{self.domain}/api/list"
-        params = {
-            "dir": directory,
-            "order": "time",
-            "desc": "1",
-            "num": "100",
-            "page": "1",
-            "app_id": "250528",
-            "web": "1",
-            "channel": "dubox",
-            "clienttype": "5",
-            "dlink": "1"
-        }
-        try:
-            resp = self.session.get(url, params=params, timeout=10)
-            data = resp.json()
-            if data.get("errno") == 0:
-                return data.get("list", [])
-            else:
-                logger.error(f"TeraBox API error: {data}")
-                return []
-        except requests.exceptions.RequestException as e:
-            # Fallback
-            logger.warning(f"Connection to {self.domain} failed, trying fallback...")
-            self.domain = "www.terabox.app"
-            url = f"https://{self.domain}/api/list"
+    def list_files(self, directory="/", page=1):
+        domains = ["dm.1024terabox.com", "www.terabox.app", "1024tera.com", "www.terabox.com"]
+        for d in domains:
             try:
-                self.session.headers.update({"Referer": f"https://{self.domain}/main"})
-                resp = self.session.get(url, params=params, timeout=10)
-                data = resp.json()
-                if data.get("errno") == 0:
-                    return data.get("list", [])
-                else:
-                    logger.error(f"TeraBox API error (fallback): {data}")
-                    return []
-            except Exception as ex:
-                logger.error(f"TeraBox connection error (fallback): {ex}")
-                return []
+                self.domain = d
+                self.session.headers.update({"Referer": f"https://{d}/main"})
+                base_url = f"https://{d}/api/list"
+                query = (
+                    f"dir={urllib.parse.quote(directory)}&"
+                    f"order=time&desc=1&num=100&page={page}&"
+                    "app_id=250528&web=1&channel=dubox&clienttype=0&dlink=1"
+                )
+                resp = self.session.get(f"{base_url}?{query}", timeout=12)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("errno") == 0: return data.get("list", [])
+            except: continue
+        return []
+
+    def get_stream_link(self, path):
+        """Advanced bypass: Extract the actual m3u8 stream from the web player."""
+        try:
+            domain = self.domain or "dm.1024terabox.com"
+            url = f"https://{domain}/play/video?path={urllib.parse.quote(path)}&t=-1"
+            logger.info(f"VLC: Scraping stream data from web player...")
+            
+            headers = self.session.headers.copy()
+            headers.update({
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate"
+            })
+            
+            resp = self.session.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                # 1. Look for m3u8
+                match = re.search(r'"(https?:[^\"]+\.m3u8[^\"]+)"', resp.text)
+                if match:
+                    m3u8_url = match.group(1).replace("\\/", "/")
+                    logger.info("VLC: Extracted m3u8 stream!")
+                    return m3u8_url
+                # 2. Look for mp4
+                match_mp4 = re.search(r'"(https?:[^\"]+\.mp4[^\"]+)"', resp.text)
+                if match_mp4:
+                    mp4_url = match_mp4.group(1).replace("\\/", "/")
+                    logger.info("VLC: Extracted mp4 stream!")
+                    return mp4_url
+            logger.error(f"VLC: Stream extraction failed (HTTP {resp.status_code})")
+        except Exception as e:
+            logger.error(f"VLC: Stream bypass error: {e}")
+        return None
 
     def get_dlink(self, fs_id):
-        # Try both the multimedia API and the direct download API on various domains
-        # Using 1024tera.com as it is often more permissive for dlinks
-        for domain in ["www.1024tera.com", self.domain]:
+        domains = ["dm.1024terabox.com", "www.1024tera.com", "www.terabox.app"]
+        for domain in domains:
             for aid in ["250528", "7092"]:
-                url = f"https://{domain}/rest/2.0/xpan/multimedia"
-                params = {
-                    "method": "filemetas",
-                    "fsids": f"[{fs_id}]",
-                    "dlink": "1",
-                    "app_id": aid
-                }
                 try:
+                    url = f"https://{domain}/rest/2.0/xpan/multimedia"
+                    params = {"method": "filemetas", "fsids": f"[{fs_id}]", "dlink": "1", "app_id": aid, "clienttype": "0"}
                     resp = self.session.get(url, params=params, timeout=10)
                     data = resp.json()
                     if data.get("errno") == 0 and data.get("list"):
                         dlink = data["list"][0].get("dlink")
                         if dlink: return dlink
-                    logger.info(f"Dlink Debug ({domain}, aid:{aid}): {data}")
-                except:
-                    continue
+                except: continue
         return None
 
-    def download_thumbnail(self, url, callback):
-        def _down():
-            try:
-                # Use a very specific browser-like header for thumbnails
-                headers = {
-                    "Referer": f"https://{self.domain}/main",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
-                }
-                resp = self.session.get(url, timeout=15, headers=headers)
-                if resp.status_code == 200:
-                    from io import BytesIO
-                    img = Image.open(BytesIO(resp.content))
-                    img.thumbnail((200, 112))
-                    photo = ImageTk.PhotoImage(img)
-                    callback(photo)
-            except:
-                pass
-        self.thumb_executor.submit(_down)
+    def resolve_share_link(self, share_url):
+        try:
+            surl = ""
+            if "/s/" in share_url: surl = share_url.split("/s/")[1].split("?")[0]
+            elif "surl=" in share_url: surl = share_url.split("surl=")[1].split("&")[0]
+            
+            for domain in ["www.terabox.app", "dm.1024terabox.com"]:
+                api_url = f"https://{domain}/share/list?surl={surl}"
+                resp = self.session.get(api_url, timeout=15)
+                data = resp.json()
+                if data.get("errno") == 0 and data.get("list"):
+                    item = data["list"][0]
+                    return {"dlink": item.get("dlink"), "title": item.get("server_filename"), "fs_id": item.get("fs_id")}
+        except: pass
+        return None
 
     def get_download_link(self, fs_id):
-        return f"https://{self.domain}/main?category=all&path=%2F" # Fallback to web
+        return f"https://{self.domain}/main?category=all&path=%2F"
 
 # --- Page Frames ---
 
@@ -876,7 +928,9 @@ class TeraBoxFrame(ttk.Frame):
         super().__init__(parent)
         self.controller = controller
         self.current_dir = "/"
+        self.page = 1
         self.tb_manager = None
+        self.btn_load_more = None
         self.setup_ui()
 
     def setup_ui(self):
@@ -892,10 +946,50 @@ class TeraBoxFrame(ttk.Frame):
 
         ttk.Button(h, text="Refresh", command=self.refresh_suggestions).pack(side=tk.RIGHT)
         
+        # --- NEW: Paste & Play Share Link ---
+        sf = ttk.LabelFrame(self, text="Paste Share Link to Stream", padding=5)
+        sf.pack(fill=tk.X, padx=10, pady=5)
+        self.entry_share = ttk.Entry(sf)
+        self.entry_share.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.entry_share.insert(0, "https://terabox.com/s/...")
+        self.entry_share.bind("<FocusIn>", lambda e: self.entry_share.delete(0, tk.END) if "..." in self.entry_share.get() else None)
+        ttk.Button(sf, text="▶ Stream Now", command=self.stream_share_link).pack(side=tk.LEFT, padx=5)
+        
         self.grid_f = MediaGridFrame(self, self.controller)
         self.grid_f.pack(fill=tk.BOTH, expand=True)
+        
+        # Load More Button
+        self.footer = ttk.Frame(self, padding=5)
+        self.footer.pack(fill=tk.X)
+        self.btn_load_more = ttk.Button(self.footer, text="Load More Files...", command=self.load_more)
+
+    def stream_share_link(self):
+        url = self.entry_share.get().strip()
+        if "/s/" not in url and "surl=" not in url:
+            return messagebox.showerror("Error", "Please paste a valid TeraBox share link.")
+        
+        config = ConfigManager.load()
+        cookie = config.get("terabox_cookie", "")
+        if not self.tb_manager:
+            self.tb_manager = TeraBoxManager(cookie)
+
+        def _resolve():
+            logger.info("TeraBox: Attempting to bypass share link...")
+            data = self.tb_manager.resolve_share_link(url)
+            if data and data.get("dlink"):
+                logger.info(f"TeraBox: Bypassed share link successfully: {data['title']}")
+                ua = self.tb_manager.session.headers.get("User-Agent")
+                # For share links, we usually don't need a specific referer other than the site root
+                options = [f":http-user-agent={ua}"]
+                self.after(0, lambda: self.controller.play_in_app(data["dlink"], data["title"], options))
+            else:
+                logger.warning("TeraBox: Bypass failed, falling back to browser player.")
+                self.after(0, lambda: self.controller.play_in_browser(url, "TeraBox Shared Content"))
+
+        threading.Thread(target=_resolve, daemon=True).start()
 
     def refresh_suggestions(self):
+        self.page = 1
         config = ConfigManager.load()
         cookie = config.get("terabox_cookie", "")
         if not cookie:
@@ -907,21 +1001,62 @@ class TeraBoxFrame(ttk.Frame):
 
         for w in self.grid_f.scrollable_frame.winfo_children():
             w.destroy()
+        
+        if self.btn_load_more:
+            self.btn_load_more.pack_forget()
 
-        files = self.tb_manager.list_files(self.current_dir)
-        if not files:
-            ttk.Label(self.grid_f.scrollable_frame, text="No files found or connection error.", padding=20).pack()
+        ttk.Label(self.grid_f.scrollable_frame, text="Loading cloud files...").pack(pady=20)
+
+        def _bg_load():
+            try:
+                files = self.tb_manager.list_files(self.current_dir, page=self.page)
+                self.after(0, lambda: self._display_files(files, clear=True))
+            except Exception as e:
+                logger.error(f"TeraBox BG Load Error: {e}")
+                self.after(0, lambda: messagebox.showerror("TeraBox", "Failed to load files."))
+
+        threading.Thread(target=_bg_load, daemon=True).start()
+
+    def load_more(self):
+        self.page += 1
+        if self.btn_load_more:
+            self.btn_load_more.config(state=tk.DISABLED, text="Loading more...")
+        
+        def _bg_load():
+            files = self.tb_manager.list_files(self.current_dir, page=self.page)
+            self.after(0, lambda: self._display_files(files, clear=False))
+            
+        threading.Thread(target=_bg_load, daemon=True).start()
+
+    def _display_files(self, files, clear=True):
+        if clear:
+            for w in self.grid_f.scrollable_frame.winfo_children():
+                w.destroy()
+
+        if not files and clear:
+            ttk.Label(self.grid_f.scrollable_frame, text="No files found or auth error.", padding=20).pack()
             return
 
+        # Current count for grid positioning
+        start_idx = len([w for w in self.grid_f.scrollable_frame.winfo_children() if isinstance(w, ttk.Frame)])
+        
         for i, f in enumerate(files):
-            self.create_remote_card(i, f)
+            self.create_remote_card(start_idx + i, f)
+
+        # Show load more if we got 100 items
+        if len(files) >= 100 and self.btn_load_more:
+            self.btn_load_more.pack(pady=10)
+            self.btn_load_more.config(state=tk.NORMAL, text="Load More Files...")
+        elif self.btn_load_more:
+            self.btn_load_more.pack_forget()
 
     def create_remote_card(self, i, file_info):
         is_dir = file_info.get("isdir") == 1
         name = file_info.get("server_filename", "Unknown")
         path = file_info.get("path")
-        # Try different thumbnail sizes/versions
-        thumb_url = file_info.get("thumbs", {}).get("url3") or file_info.get("thumbs", {}).get("url2") or file_info.get("thumbs", {}).get("url1")
+        # Use url3 (High Res) -> url2 -> url1
+        thumbs = file_info.get("thumbs", {})
+        thumb_url = thumbs.get("url3") or thumbs.get("url2") or thumbs.get("url1")
         fs_id = file_info.get("fs_id")
         dlink = file_info.get("dlink") 
         
@@ -933,11 +1068,12 @@ class TeraBoxFrame(ttk.Frame):
         lbl_thumb.pack()
         
         if thumb_url and not is_dir and self.tb_manager:
-            def update_thumb(photo, l=lbl_thumb):
-                if l.winfo_exists():
-                    l.config(image=photo, text="")
-                    l.image = photo
-            self.tb_manager.download_thumbnail(thumb_url, update_thumb)
+             # TeraBox thumbnails require the ndus cookie and specific referer
+             tb_headers = {
+                 "Referer": f"https://{self.tb_manager.domain}/main",
+                 "Cookie": self.tb_manager.session.headers.get("Cookie", "")
+             }
+             self.controller.thumb_gen.queue_thumbnail(thumb_url, lbl_thumb, priority=5, extra_headers=tb_headers)
 
         dname = name[:20] + "..." if len(name) > 23 else name
         lbl_name = ttk.Label(card, text=dname, font=("Segoe UI", 9, "bold"), wraplength=180, cursor="hand2")
@@ -965,7 +1101,7 @@ class TeraBoxFrame(ttk.Frame):
                 btns.pack(pady=2)
                 
                 # Play in VLC (Embedded)
-                ttk.Button(btns, text="VLC", width=6, command=lambda f=fs_id, d=dlink, n=name: self.play_in_embedded_vlc(f, d, n)).pack(side=tk.LEFT, padx=2)
+                ttk.Button(btns, text="VLC", width=6, command=lambda f=fs_id, d=dlink, n=name, p=path: self.play_in_embedded_vlc(f, d, n, p)).pack(side=tk.LEFT, padx=2)
                 
                 # Play In-App (Browser)
                 domain = self.tb_manager.domain if self.tb_manager else "dm.1024terabox.com"
@@ -975,19 +1111,63 @@ class TeraBoxFrame(ttk.Frame):
 
                 # Open in PC App (using protocol handler)
                 ttk.Button(btns, text="App", width=6, command=lambda n=name: self.open_in_pc_app(n)).pack(side=tk.LEFT, padx=2)
+                
+                # Download
+                ttk.Button(btns, text="📥", width=3, command=lambda f=fs_id, d=dlink, n=name, p=path: self.download_terabox_file(f, d, n, p)).pack(side=tk.LEFT, padx=2)
 
-    def play_in_embedded_vlc(self, fs_id, dlink=None, title="Video"):
+    def download_terabox_file(self, fs_id, dlink=None, title="Video", path=None):
         if not self.tb_manager: return
         
         def _resolve():
+            logger.info(f"TeraBox: Resolving download for {title}...")
+            # Use same resolution logic as VLC
             final_link = dlink or self.tb_manager.get_dlink(fs_id)
+            
+            if not final_link and path:
+                logger.info("TeraBox: API failed. Using Web Stream link for download...")
+                domain = self.tb_manager.domain or "dm.1024terabox.com"
+                final_link = f"https://{domain}/play/video?path={urllib.parse.quote(path)}&t=-1"
+            
+            if final_link:
+                cookie = self.tb_manager.session.headers.get("Cookie", "")
+                ua = self.tb_manager.session.headers.get("User-Agent", "")
+                headers = {
+                    "User-Agent": ua,
+                    "Cookie": cookie,
+                    "Referer": f"https://{self.tb_manager.domain}/main"
+                }
+                self.after(0, lambda: self.controller.start_cloud_download(final_link, title, headers))
+            else:
+                self.after(0, lambda: messagebox.showerror("Error", "Could not resolve TeraBox download link."))
+
+        threading.Thread(target=_resolve, daemon=True).start()
+
+    def play_in_embedded_vlc(self, fs_id, dlink=None, title="Video", path=None):
+        if not self.tb_manager: return
+        
+        def _resolve():
+            logger.info("VLC: Attempting to resolve playback link...")
+            # 1. Try direct link from API first
+            final_link = dlink or self.tb_manager.get_dlink(fs_id)
+            
+            # 2. If API fails (common), use the Web Player Scraper
+            if not final_link and path:
+                logger.info("VLC: API resolution failed. Scraping stream manifest...")
+                final_link = self.tb_manager.get_stream_link(path)
+            
             if not final_link:
                 self.after(0, lambda: messagebox.showerror("TeraBox", "Could not extract direct link for VLC."))
                 return
 
             cookie = self.tb_manager.session.headers.get("Cookie", "")
             ua = self.tb_manager.session.headers.get("User-Agent", "")
-            options = [f":http-user-agent={ua}", f":http-header=Cookie: {cookie}"]
+            # Mirror-specific referer is MANDATORY for TeraBox streaming
+            ref = f"https://{self.tb_manager.domain}/main"
+            options = [
+                f":http-user-agent={ua}", 
+                f":http-header=Cookie: {cookie}",
+                f":http-referrer={ref}"
+            ]
             
             self.after(0, lambda: self.controller.play_in_app(final_link, title, options))
 
@@ -1446,13 +1626,17 @@ class OrganizerFrame(ttk.Frame):
             v.set(False)
 
     def upload_to_cloud(self):
-        if not API_ID:
-            return messagebox.showerror("Error", "Check .env for TG_API_ID")
+        tid, thash = ConfigManager.get_telegram_creds()
+        if not tid:
+            return messagebox.showerror("Error", "Telegram API ID not found. Set it in Settings or .env")
+        
         sel = [p for p, v in self.check_vars.items() if v.get()]
         if not sel:
             return messagebox.showwarning("Warning", "Select files first")
-        if not self.tg_manager:
-            self.tg_manager = TelegramManager(API_ID, API_HASH)
+        
+        if not self.tg_manager or self.tg_manager.api_id != tid:
+            self.tg_manager = TelegramManager(tid, thash)
+            
         fpaths = [os.path.join(self.source_dir, p) for p in sel]
         self.btn_cloud.config(state=tk.DISABLED)
         self.tg_manager.upload_files(fpaths, lambda: self.controller.ask_string_threadsafe("Login", "Phone:"), lambda: self.controller.ask_string_threadsafe("Login", "Code:"), lambda: self.controller.ask_string_threadsafe("Login", "2FA:"), lambda s, t, sp, fn: self.after(0, lambda: self._up_f(s, t, sp, fn)), lambda c, t: self.after(0, lambda: self._up_o(c, t)), lambda count: self.after(0, lambda: self._up_done(count)), lambda err: self.after(0, lambda: self._up_err(err)))
@@ -1535,17 +1719,48 @@ class SettingsFrame(ttk.Frame):
         ttk.Button(b, text="+ Add Directory", command=self.add_dir_guarded).pack(side=tk.LEFT, padx=5)
         ttk.Button(b, text="- Remove Selected", command=self.remove_dir_guarded).pack(side=tk.LEFT, padx=5)
         
+        # Telegram Config
+        tg_f = ttk.LabelFrame(self, text="Telegram Configuration", padding=10)
+        tg_f.pack(fill=tk.X, padx=20, pady=10)
+        
+        config = ConfigManager.load()
+        # API ID
+        rid = ttk.Frame(tg_f)
+        rid.pack(fill=tk.X, pady=2)
+        ttk.Label(rid, text="API ID:", width=12).pack(side=tk.LEFT)
+        self.entry_tg_id = ttk.Entry(rid)
+        self.entry_tg_id.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.entry_tg_id.insert(0, config.get("tg_api_id", ""))
+        
+        # API HASH
+        rh = ttk.Frame(tg_f)
+        rh.pack(fill=tk.X, pady=2)
+        ttk.Label(rh, text="API HASH:", width=12).pack(side=tk.LEFT)
+        self.entry_tg_hash = ttk.Entry(rh, show="*")
+        self.entry_tg_hash.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.entry_tg_hash.insert(0, config.get("tg_api_hash", ""))
+        
+        ttk.Button(tg_f, text="Save Telegram Credentials", command=self.save_tg_creds).pack(pady=5)
+
         # TeraBox Config
         tb_f = ttk.LabelFrame(self, text="TeraBox Configuration", padding=10)
         tb_f.pack(fill=tk.X, padx=20, pady=10)
         ttk.Label(tb_f, text="ndus Cookie:").pack(side=tk.LEFT)
         self.entry_cookie = ttk.Entry(tb_f, show="*", width=50)
         self.entry_cookie.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
-        config = ConfigManager.load()
         self.entry_cookie.insert(0, config.get("terabox_cookie", ""))
         ttk.Button(tb_f, text="Save Cookie", command=self.save_cookie).pack(side=tk.LEFT)
 
         self.load_list()
+
+    def save_tg_creds(self):
+        tid = self.entry_tg_id.get().strip()
+        thash = self.entry_tg_hash.get().strip()
+        config = ConfigManager.load()
+        config["tg_api_id"] = tid
+        config["tg_api_hash"] = thash
+        ConfigManager.save(config)
+        messagebox.showinfo("Telegram", "Credentials saved to local config.")
 
     def save_cookie(self):
         c = self.entry_cookie.get().strip()
@@ -1635,14 +1850,21 @@ class VideoPlayer(tk.Toplevel):
         self.geometry("1000x700")
         self.configure(bg="black")
         
-        # Ensure window is on top but has full decorations
+        # Ensure window has full decorations (Restore Minimize/Maximize)
+        self.resizable(True, True)
+        self.attributes("-toolwindow", 0)
         self.lift()
-        self.focus_force()
         
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         
-        # VLC Setup
-        vlc_args = ['--no-video-title-show', '--avcodec-hw=none', '--no-stats', '--quiet']
+        # VLC Setup optimized for HTTP streaming on Windows
+        vlc_args = [
+            '--no-video-title-show',
+            '--avcodec-hw=none',
+            '--vout=direct3d11', 
+            '--network-caching=3000',
+            '--quiet'
+        ]
         self.instance = vlc.Instance(vlc_args)
         self.player = self.instance.media_player_new()
         
@@ -1672,8 +1894,6 @@ class VideoPlayer(tk.Toplevel):
         self.is_updating = True
         self.is_seeking = False
 
-        # Do NOT use transient(parent) as it removes min/max buttons on some Windows versions
-        # Instead, just wait for visibility
         self.wait_visibility()
         self.after(500, self._start_playback)
         self.update_progress()
@@ -1688,6 +1908,7 @@ class VideoPlayer(tk.Toplevel):
             if os.path.exists(path):
                 path = os.path.abspath(os.path.normpath(path))
 
+            # HWND must be set after visibility
             h = self.video_frame.winfo_id()
             if sys.platform == "win32":
                 self.player.set_hwnd(h)
@@ -1703,7 +1924,7 @@ class VideoPlayer(tk.Toplevel):
             
             self.player.set_media(self.media)
             self.player.play()
-            logger.info(f"VLC Playback Start: {path}")
+            logger.info(f"VLC Playback Start: {path[:100]}...")
         except Exception as e:
             logger.error(f"VLC Playback Error: {e}")
 
@@ -1768,6 +1989,10 @@ class MediaSuggesterApp(tk.Tk):
         self.title("Media Suggester Pro")
         self.geometry("1100x800")
         self.thumb_gen = ThumbnailGenerator(self)
+        
+        self.log_history = []
+        self.log_widget = None # Track open log window
+        
         style = ttk.Style()
         style.configure("Sidebar.TFrame", background="#2c3e50")
         style.configure("Sidebar.TButton", padding=10, width=20)
@@ -1792,7 +2017,51 @@ class MediaSuggesterApp(tk.Tk):
         ttk.Button(self.side_items, text="📦 Bunkr (Beta)", style="Sidebar.TButton", command=lambda: self.show_frame(BunkrFrame)).pack(pady=5)
         ttk.Button(self.side_items, text="📁 Organizer", style="Sidebar.TButton", command=lambda: self.show_frame(OrganizerFrame)).pack(pady=5)
         ttk.Button(self.side_items, text="⚙ Settings", style="Sidebar.TButton", command=lambda: self.show_frame(SettingsFrame)).pack(pady=5)
+        ttk.Button(self.side_items, text="📜 View Logs", style="Sidebar.TButton", command=self.show_log_window).pack(pady=5)
+        
+        # Status Bar at bottom of sidebar
+        self.lbl_status = ttk.Label(self.sidebar, text="Ready", foreground="#bdc3c7", background="#2c3e50", font=("Segoe UI", 8), wraplength=180, padding=10)
+        self.lbl_status.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Log handler integration
+        handler = UIHandler(self.update_status)
+        logging.getLogger().addHandler(handler)
+        
         self.show_frame(SplashFrame)
+
+    def update_status(self, msg):
+        self.log_history.append(msg)
+        if len(self.log_history) > 200: self.log_history.pop(0)
+        
+        # Update the mini status bar
+        self.after(0, lambda: self.lbl_status.config(text=msg.split(" - ")[-1][:100]))
+        
+        # Update live log window if open
+        if self.log_widget and self.log_widget.winfo_exists():
+            self.after(0, lambda m=msg: self._append_to_log_widget(m))
+
+    def _append_to_log_widget(self, msg):
+        try:
+            self.log_widget.config(state=tk.NORMAL)
+            self.log_widget.insert(tk.END, msg + "\n")
+            self.log_widget.see(tk.END)
+            self.log_widget.config(state=tk.DISABLED)
+        except: pass
+
+    def show_log_window(self):
+        log_win = tk.Toplevel(self)
+        log_win.title("Live Diagnostic Logs")
+        log_win.geometry("800x500")
+        
+        txt = tk.Text(log_win, bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 10))
+        txt.pack(fill=tk.BOTH, expand=True)
+        
+        # Initialize with history
+        for line in self.log_history:
+            txt.insert(tk.END, line + "\n")
+        txt.see(tk.END)
+        txt.config(state=tk.DISABLED)
+        self.log_widget = txt # Link for live updates
 
     def play_in_app(self, source, title, options=None):
         VideoPlayer(self, source, title, options)
@@ -1822,6 +2091,32 @@ class MediaSuggesterApp(tk.Tk):
         res_queue = queue.Queue()
         self.after(0, lambda: res_queue.put(simpledialog.askstring(title, prompt)))
         return res_queue.get()
+
+    def start_cloud_download(self, url, filename, headers=None):
+        """Standardized background downloader for Bunkr and TeraBox."""
+        save_path = filedialog.asksaveasfilename(defaultextension=os.path.splitext(filename)[1], initialfile=filename)
+        if not save_path: return
+
+        def _task():
+            try:
+                logger.info(f"Download: Starting {filename}...")
+                self.update_status(f"Downloading {filename}...")
+                
+                resp = requests.get(url, headers=headers, stream=True, timeout=30, verify=False)
+                if resp.status_code == 200:
+                    with open(save_path, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk: f.write(chunk)
+                    logger.info(f"Download: Finished {filename} successfully.")
+                    self.after(0, lambda: messagebox.showinfo("Download", f"Successfully saved to:\n{save_path}"))
+                else:
+                    logger.error(f"Download failed: HTTP {resp.status_code}")
+                    self.after(0, lambda: messagebox.showerror("Download Error", f"Server returned error {resp.status_code}"))
+            except Exception as e:
+                logger.error(f"Download error: {e}")
+                self.after(0, lambda: messagebox.showerror("Download Error", str(e)))
+
+        threading.Thread(target=_task, daemon=True).start()
 
 if __name__ == "__main__":
     app = MediaSuggesterApp()
